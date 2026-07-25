@@ -131,6 +131,7 @@ class SignozMCPClient:
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
+        self._api_key = os.environ.get("SIGNOZ_API_KEY", "")
         # Client is created lazily / reused across calls rather than opened
         # per-request, so we're not paying connection setup cost on every
         # agent decision.
@@ -152,30 +153,47 @@ class SignozMCPClient:
     async def _call_tool(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Single choke point for talking to the MCP server.
 
-        # TODO: verify against real SigNoz MCP server response shape.
-        # This assumes an HTTP endpoint that accepts an MCP-style
-        # `{"tool": ..., "arguments": ...}` call and returns
-        # `{"result": {...}}` on success. If the real server speaks
-        # JSON-RPC-over-stdio (standard MCP transport) instead, this method
-        # is the only place that needs to change — replace the httpx POST
-        # with an MCP ClientSession `call_tool(...)` invocation and keep the
-        # `dict[str, Any]` return shape the same so `_parse_*` below don't
-        # need touching.
+        Confirmed against a real, running SigNoz Foundry MCP server: it speaks
+        standard MCP over streamable-HTTP at `<host>:8000/mcp`, authenticated
+        via a `SIGNOZ-API-KEY` header (SigNoz service-account key) — not the
+        REST-style envelope this file originally guessed at. `session.initialize()`
+        + `session.list_tools()` were verified interactively to return real
+        SigNoz tool names (e.g. `signoz_query_metrics`, `signoz_aggregate_traces`).
+
+        A fresh session is opened per call rather than kept alive across
+        requests — simpler and safer under the "never load-bearing" rule this
+        file exists to enforce, at the cost of one extra handshake per call.
 
         Raises on any failure — callers (the public methods below) are
         responsible for catching and converting to an "unavailable" result.
-        This method itself stays exception-transparent so it's easy to unit
-        test against a mock transport.
         """
-        client = await self._client()
-        response = await client.post(
-            "/mcp/tools/call",
-            json={"tool": tool, "arguments": arguments},
-        )
-        response.raise_for_status()
-        payload = response.json()
-        # Be defensive about envelope shape too, since it's unverified.
-        return payload.get("result", payload)
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        headers = {"SIGNOZ-API-KEY": self._api_key} if self._api_key else {}
+        mcp_url = f"{self._base_url}/mcp"
+
+        async with streamablehttp_client(mcp_url, headers=headers) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(tool, arguments)
+
+        # MCP tool results come back as a list of content blocks (usually
+        # TextContent with a JSON string body), not a bare dict — unwrap and
+        # parse defensively rather than assuming a fixed shape.
+        import json as _json
+
+        for block in getattr(result, "content", []) or []:
+            text = getattr(block, "text", None)
+            if text:
+                try:
+                    parsed = _json.loads(text)
+                    if isinstance(parsed, dict):
+                        return parsed
+                    return {"data": parsed}
+                except ValueError:
+                    return {"raw_text": text}
+        return {}
 
     # ----------------------------------------------------------------- #
     # Public, typed, fail-safe query methods
@@ -193,7 +211,7 @@ class SignozMCPClient:
         """
         try:
             raw = await self._call_tool(
-                "query_metrics",
+                "signoz_query_metrics",
                 {
                     # Assumption (per task spec): cost/model attributes exist
                     # on relevant LLM-call spans.
@@ -243,7 +261,7 @@ class SignozMCPClient:
         """
         try:
             raw = await self._call_tool(
-                "query_traces",
+                "signoz_aggregate_traces",
                 {
                     "filter": "status = error",
                     "window_minutes": minutes,
@@ -277,7 +295,7 @@ class SignozMCPClient:
         """
         try:
             raw = await self._call_tool(
-                "query_spans",
+                "signoz_aggregate_traces",
                 {
                     # Assumption (per task spec): Validator spans carry
                     # `cwe_id` and `verdict` attributes, and retry spans carry
