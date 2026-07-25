@@ -46,4 +46,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request,os; urllib.request.urlopen(f'http://localhost:{os.getenv(\"PORT\",\"8000\")}/slo-status')" || exit 1
 
 # Shell form so ${PORT} expands (Railway/Render inject their own PORT).
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers 2
+CMD uvicorn backend.main:app --host 0.0.0.0 --port ${PORT} --workers 2
